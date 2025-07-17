@@ -384,7 +384,7 @@ def main():
             feedback.base.tool_pose_theta_z
         )
         target_pose = (
-            feedback.base.tool_pose_x - 0.05,
+            feedback.base.tool_pose_x + 0.1,
             feedback.base.tool_pose_y,
             feedback.base.tool_pose_z,
             feedback.base.tool_pose_theta_x,
