@@ -510,7 +510,7 @@ def main():
         base_cyclic = BaseCyclicClient(router)
         # =======================================
         # 示例1：末端笛卡尔空间增量运动
-        # cartesian_move(base, base_cyclic, dx=0, dy=+0.1, dz=+0.1, dtheta_x=0, dtheta_y=0, dtheta_z=0)
+        cartesian_move(base, base_cyclic, dx=0, dy=0, dz=0.1, dtheta_x=0, dtheta_y=0, dtheta_z=0)
         # =======================================
         # 示例2：关节空间运动
         # joint_move(base, [0, 0, 0, 0, 0, 0, 0])
@@ -583,29 +583,29 @@ def main():
         # print(f"[get_ee_pose] 末端欧拉角 [roll,pitch,yaw] (度): {np.degrees(ee_euler)}")
         # =======================================
         # 示例11：获取末端受力信息
-        ee_force, total_force = get_ee_force(base_cyclic)
-        print(f"[get_ee_force] 末端力分量 [fx,fy,fz] (牛顿): {ee_force}")
-        print(f"[get_ee_force] 末端合力大小 (牛顿): {total_force}")
-        # =======================================
-        # 示例12：获取关节速度信息
-        joint_velocities_deg = get_joint_vel(base_cyclic, use_radian=False)
-        print(f"[get_joint_vel] 当前七个关节的速度（度/秒）: {joint_velocities_deg}")
-        joint_velocities_rad = get_joint_vel(base_cyclic, use_radian=True)
-        print(f"[get_joint_vel] 当前七个关节的速度（弧度/秒）: {joint_velocities_rad}")
-        # =======================================
-        # 示例13：设置关节姿态
-        # 获取当前关节角作为参考
-        current_joint_angles = get_joint_angles(base_cyclic, use_radian=False)
-        print(f"[set_joint_pose] 当前关节角: {current_joint_angles}")
+        # ee_force, total_force = get_ee_force(base_cyclic)
+        # print(f"[get_ee_force] 末端力分量 [fx,fy,fz] (牛顿): {ee_force}")
+        # print(f"[get_ee_force] 末端合力大小 (牛顿): {total_force}")
+        # # =======================================
+        # # 示例12：获取关节速度信息
+        # joint_velocities_deg = get_joint_vel(base_cyclic, use_radian=False)
+        # print(f"[get_joint_vel] 当前七个关节的速度（度/秒）: {joint_velocities_deg}")
+        # joint_velocities_rad = get_joint_vel(base_cyclic, use_radian=True)
+        # print(f"[get_joint_vel] 当前七个关节的速度（弧度/秒）: {joint_velocities_rad}")
+        # # =======================================
+        # # 示例13：设置关节姿态
+        # # 获取当前关节角作为参考
+        # current_joint_angles = get_joint_angles(base_cyclic, use_radian=False)
+        # print(f"[set_joint_pose] 当前关节角: {current_joint_angles}")
         
-        # 设置到零位姿态
-        # set_joint_pose(base, [0, 0, 0, 0, 0, 0, 0])
+        # # 设置到零位姿态
+        # # set_joint_pose(base, [0, 0, 0, 0, 0, 0, 0])
         
-        # 设置到示例姿态（注释掉以避免意外移动）
-        # example_pose = [90, 45, -30, 0, 60, -45, 0]
-        # set_joint_pose(base, example_pose)
+        # # 设置到示例姿态（注释掉以避免意外移动）
+        # # example_pose = [90, 45, -30, 0, 60, -45, 0]
+        # # set_joint_pose(base, example_pose)
         
-        print("[set_joint_pose] 关节姿态设置功能已准备就绪（示例代码已注释）")
+        # print("[set_joint_pose] 关节姿态设置功能已准备就绪（示例代码已注释）")
 
 if __name__ == "__main__":
     main() 
