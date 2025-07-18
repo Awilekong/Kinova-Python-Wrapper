@@ -1,14 +1,14 @@
 # 🤖 Kinova Gen3/G3L Python Advanced Control API
 
 > 🚀 **A user-friendly, efficient, and professional Python interface for Kinova robotic arms**  
-> Perfect for research, education, automation, and robotics competitions!
+> Perfect for research, education, automation, robotics competitions, and human demonstration learning!
 
 ---
 
 ## 📦 Project Overview
 
 This project is a high-level Python API wrapper based on the official Kinova Python SDK.  
-It provides easy-to-use, high-level interfaces for controlling Kinova Gen3/G3L arms, including **Cartesian and joint space motion, trajectory planning, forward/inverse kinematics, state queries, gripper control, and impedance control**—making secondary development much easier.
+It provides easy-to-use, high-level interfaces for controlling Kinova Gen3/G3L arms, including **Cartesian and joint space motion, trajectory planning, forward/inverse kinematics, state queries, gripper control, impedance control, and human demonstration learning**—making secondary development much easier.
 
 ---
 
@@ -18,6 +18,7 @@ It provides easy-to-use, high-level interfaces for controlling Kinova Gen3/G3L a
 .
 ├── kinova_basic.py              # 🆕 Kinova robot high-level control class (recommended)
 ├── kinova_tool_configuration.py # 🆕 Tool configuration management class
+├── robot_data_replay.py         # 🆕 Robot data replay script (multi-arm support)
 ├── my_api_kinova.py             # Basic API script (functional interface)
 ├── utilities.py                 # Connection/session management utilities
 ├── franka_basic.py              # Franka robot control class (reference implementation)
@@ -40,6 +41,13 @@ It provides easy-to-use, high-level interfaces for controlling Kinova Gen3/G3L a
 - **Trajectory planning**: Joint space and Cartesian space trajectory execution
 - **State monitoring**: Real-time position, velocity, torque, and force sensor data
 
+### 🆕 **Robot Data Replay System**
+- **Multi-arm support**: Support for Kinova and Franka robots
+- **Coordinate system transformation**: Complete table coordinate to robot coordinate conversion
+- **Trajectory replay**: Precise replay of human demonstration trajectory data
+- **Visualization browsing**: Support for RGB/depth image sequence browsing
+- **Tool configuration management**: Automatic robot tool configuration updates
+
 ### **Basic API Functions**
 - **Cartesian motion** (absolute, relative, trajectory)
 - **Joint space motion** (single/multiple points)
@@ -60,6 +68,9 @@ pip install kortex_api-*.whl
 
 # Install gripper control library (optional)
 pip install pylibrm
+
+# Install ROS dependencies (for data replay)
+sudo apt-get install ros-noetic-tf ros-noetic-rospy
 ```
 
 ### 2. Using Kinova Class (Recommended)
@@ -95,7 +106,24 @@ forces = kinova.get_ee_force()   # Get end-effector forces
 kinova.close()
 ```
 
-### 3. Tool Configuration Management
+### 3. Robot Data Replay
+
+```python
+# Use robot_data_replay.py for trajectory replay
+python robot_data_replay.py --arm kinova --mode trajectory --idx 0
+
+# Visualize recorded images
+python robot_data_replay.py --arm kinova --mode rgb --idx 0
+
+# Supported command line arguments
+# --arm: Robot type (kinova, left, right)
+# --mode: Mode (trajectory, rgb, depth)
+# --idx: Data file index
+# --base_path: Data base path
+# --data_mode: Data mode (grasp, open, grasp_noise, open_noise)
+```
+
+### 4. Tool Configuration Management
 
 ```python
 from kinova_tool_configuration import KinovaToolConfiguration
@@ -120,7 +148,7 @@ tool_config.set_custom_gripper_config(
 )
 ```
 
-### 4. Using Basic API Functions
+### 5. Using Basic API Functions
 
 ```python
 from my_api_kinova import *
@@ -177,6 +205,15 @@ with utilities.DeviceConnection.createTcpConnection(args) as router:
 | | `get_gripper_width()` | Get gripper width |
 | **Kinematics** | `compute_fk(joint_angles)` | Forward kinematics |
 | | `compute_ik(pose, guess)` | Inverse kinematics |
+
+### 🆕 **Data Replay Functions**
+
+| Feature | Script/Function | Description/Parameters |
+|---------|----------------|----------------------|
+| Trajectory replay | `robot_data_replay.py` | --arm kinova --mode trajectory |
+| Image browsing | `robot_data_replay.py` | --mode rgb/depth |
+| Coordinate transform | `create_transform_matrix()` | axis_mapping, translation |
+| Pose transform | `transform_pose_table_to_kinova()` | pose, translation, axis_mapping |
 
 ### **Basic API Functions**
 
@@ -253,6 +290,24 @@ finally:
     kinova.close()
 ```
 
+### 🆕 Human Demonstration Learning Example
+
+```python
+# 1. Record human demonstration data (using franka_data_recording.py)
+# 2. Replay data to Kinova robot
+
+# Use robot_data_replay.py for trajectory replay
+python robot_data_replay.py \
+    --arm kinova \
+    --mode trajectory \
+    --idx 0 \
+    --base_path ./paper_hdf5_v4/human \
+    --data_mode grasp \
+    --item small_box \
+    --zip zip_top \
+    --cam cam_up
+```
+
 ---
 
 ## 🔧 Tool Configuration Guide
@@ -287,6 +342,22 @@ tool_config.set_custom_gripper_config(
 )
 ```
 
+### 🆕 Coordinate System Transformation Configuration
+
+In `robot_data_replay.py`, the system automatically handles coordinate system transformations:
+
+```python
+# Kinova robot coordinate mapping
+axis_mapping = {
+    'kinova_x': 'table_-x',    # Kinova's X-axis = table's negative X-axis
+    'kinova_y': 'table_-y',    # Kinova's Y-axis = table's negative Y-axis
+    'kinova_z': 'table_z'      # Kinova's Z-axis = table's Z-axis
+}
+
+# Translation vector (relative to table coordinate system)
+shift_kinova = np.array([0.01, 0.132, 0.0435])
+```
+
 ---
 
 ## 📝 Notes
@@ -298,6 +369,8 @@ tool_config.set_custom_gripper_config(
 - **Parameter validation**: All APIs perform parameter validation and will raise exceptions for invalid input
 - **Trajectory planning**: Keep the number of waypoints reasonable for trajectory motion to avoid timeouts
 - **Inverse kinematics**: Inverse kinematics may have multiple solutions; providing an initial guess helps convergence
+- **Coordinate transformation**: Ensure coordinate mapping and translation vector settings are correct
+- **Data replay**: Confirm robot is in a safe position before replaying
 
 ---
 
@@ -322,6 +395,13 @@ tool_config.set_custom_gripper_config(
 - **Parameter adjustment**: Adjustable stiffness and damping parameters
 - **Safety protection**: Automatic timeout and error recovery mechanisms
 
+### 🆕 **Human Demonstration Learning Features**
+- **Multi-arm support**: Support for Kinova and Franka robots
+- **Complete coordinate transformation**: Handle coordinate system differences between robots
+- **Precise trajectory replay**: Millimeter-level precision trajectory execution
+- **Visualization data browsing**: Interactive browsing of image sequences
+- **Automatic tool configuration**: Automatically update robot tool configuration before replay
+
 ---
 
 ## 💡 Contributing & Feedback
@@ -337,6 +417,7 @@ tool_config.set_custom_gripper_config(
 - [Kinova Official Documentation](https://github.com/Kinovarobotics/kortex)
 - [Kinova Python API Examples](./Kinova-kortex2_Gen3_G3L/api_python/examples/)
 - [PyLibRM Gripper Control Library](https://github.com/robotiq/pylibrm)
+- [ROS TF Coordinate Transformations](http://wiki.ros.org/tf)
 
 ---
 
