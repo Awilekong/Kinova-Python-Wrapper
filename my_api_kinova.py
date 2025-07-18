@@ -10,6 +10,8 @@ Kinova Gen3/G3L机械臂常用运动API集合。
 import sys
 import os
 import threading
+import numpy as np
+from scipy.spatial.transform import Rotation
 from kortex_api.autogen.client_stubs.BaseClientRpc import BaseClient
 from kortex_api.autogen.client_stubs.BaseCyclicClientRpc import BaseCyclicClient
 from kortex_api.autogen.messages import Base_pb2
@@ -241,6 +243,168 @@ def get_joint_torque(base_cyclic):
         torques.append(0.0)
     return torques[:7]
 
+def get_ee_pose(base_cyclic):
+    """
+    获取当前末端执行器（EE）的位姿信息。
+    返回末端位置、四元数和欧拉角三个numpy数组。
+    
+    参数：
+        base_cyclic (BaseCyclicClient): 机械臂BaseCyclic服务客户端。
+    返回：
+        tuple[np.ndarray]: (ee_position, ee_quaternion, ee_euler)
+            - ee_position (np.ndarray): 末端位置 [x, y, z] (米)
+            - ee_quaternion (np.ndarray): 末端四元数 [w, x, y, z]
+            - ee_euler (np.ndarray): 末端欧拉角 [roll, pitch, yaw] (弧度)
+    注意：
+        - 位置单位为米，欧拉角单位为弧度。
+        - 四元数格式为 [w, x, y, z]，欧拉角顺序为 [roll, pitch, yaw]。
+        - 欧拉角基于XYZ旋转顺序（内旋）。
+    示例：
+        ee_pos, ee_quat, ee_euler = get_ee_pose(base_cyclic)
+        print(f"末端位置: {ee_pos}")
+        print(f"末端四元数: {ee_quat}")
+        print(f"末端欧拉角: {ee_euler}")
+    """
+    feedback = base_cyclic.RefreshFeedback()
+    
+    # 获取末端位置 (米)
+    ee_position = np.array([
+        feedback.base.tool_pose_x,
+        feedback.base.tool_pose_y,
+        feedback.base.tool_pose_z
+    ])
+    
+    # 获取末端欧拉角 (度转弧度)
+    import math
+    ee_euler_deg = np.array([
+        feedback.base.tool_pose_theta_x,
+        feedback.base.tool_pose_theta_y,
+        feedback.base.tool_pose_theta_z
+    ])
+    ee_euler = np.radians(ee_euler_deg)  # 转换为弧度
+    
+    # 将欧拉角转换为四元数
+    # 注意：Kinova使用XYZ旋转顺序，需要转换为scipy的'xyz'格式
+    rotation = Rotation.from_euler('xyz', ee_euler, degrees=False)
+    ee_quaternion = rotation.as_quat()  # 返回 [x, y, z, w] 格式
+    
+    # 转换为 [w, x, y, z] 格式
+    ee_quaternion = np.array([ee_quaternion[3], ee_quaternion[0], ee_quaternion[1], ee_quaternion[2]])
+    
+    return ee_position, ee_quaternion, ee_euler
+
+def get_ee_force(base_cyclic):
+    """
+    获取当前末端执行器（EE）的受力信息。
+    返回末端在x/y/z方向的力分量及合力。
+    
+    参数：
+        base_cyclic (BaseCyclicClient): 机械臂BaseCyclic服务客户端。
+    返回：
+        tuple[np.ndarray, float]: (ee_force, total_force)
+            - ee_force (np.ndarray): 末端力分量 [fx, fy, fz] (牛顿)
+            - total_force (float): 末端合力大小 (牛顿)
+    注意：
+        - 力分量为正值表示沿坐标轴正方向，负值表示沿坐标轴负方向。
+        - 合力通过三个分量的平方和开根号计算得出。
+        - 当机械臂未受到外力时，力值应接近零。
+    示例：
+        ee_force, total_force = get_ee_force(base_cyclic)
+        print(f"末端力分量: {ee_force}")
+        print(f"末端合力: {total_force}")
+    """
+    feedback = base_cyclic.RefreshFeedback()
+    
+    # 获取末端力分量 (牛顿)
+    ee_force = np.array([
+        feedback.base.tool_external_wrench_force_x,
+        feedback.base.tool_external_wrench_force_y,
+        feedback.base.tool_external_wrench_force_z
+    ])
+    
+    # 计算合力大小
+    total_force = np.linalg.norm(ee_force)
+    
+    return ee_force, total_force
+
+def get_joint_vel(base_cyclic, use_radian=False):
+    """
+    获取当前七个关节的关节速度。
+    
+    参数：
+        base_cyclic (BaseCyclicClient): 机械臂BaseCyclic服务客户端。
+        use_radian (bool): True-返回弧度/秒，False-返回度/秒（默认）。
+    返回：
+        list[float]: 七个关节速度列表（度/秒或弧度/秒）。
+    注意：
+        - 返回顺序与机械臂关节顺序一致。
+        - 若实际关节数不足7，自动补零。
+        - 正值表示正向旋转，负值表示反向旋转。
+    示例：
+        velocities = get_joint_vel(base_cyclic, use_radian=True)
+    """
+    import math
+    feedback = base_cyclic.RefreshFeedback()
+    velocities = []
+    for actuator in feedback.actuators:
+        velocity = actuator.velocity
+        if use_radian:
+            velocity = math.radians(velocity)
+        velocities.append(velocity)
+    while len(velocities) < 7:
+        velocities.append(0.0)
+    return velocities[:7]
+
+def set_joint_pose(base, joint_angles, timeout=TIMEOUT_DURATION):
+    """
+    设置机械臂关节姿态。
+    控制机械臂各关节移动到指定角度，与joint_move功能相同。
+    
+    参数：
+        base (BaseClient): 机械臂Base服务客户端。
+        joint_angles (list[float]): 长度为7的关节角度列表（单位：度，顺序为关节1~7）。
+        timeout (float): 超时时间（秒），默认20。
+    返回：
+        bool: True-动作完成，False-超时/中止。
+    注意：
+        - 角度超出机械臂物理限制会导致动作失败。
+        - 关节顺序需与机械臂实际顺序一致。
+        - 此函数与joint_move功能相同，提供更直观的命名。
+    示例：
+        set_joint_pose(base, [0, 0, 0, 0, 0, 0, 0])
+        set_joint_pose(base, [90, 45, -30, 0, 60, -45, 0])
+    """
+    if not isinstance(joint_angles, (list, tuple)) or len(joint_angles) != 7:
+        raise ValueError("joint_angles 必须为长度为7的列表或元组")
+    
+    action = Base_pb2.Action()
+    action.name = "API Set Joint Pose"
+    action.application_data = ""
+    
+    for joint_id, angle in enumerate(joint_angles):
+        joint_angle = action.reach_joint_angles.joint_angles.joint_angles.add()
+        joint_angle.joint_identifier = joint_id
+        joint_angle.value = angle
+    
+    e = threading.Event()
+    notification_handle = base.OnNotificationActionTopic(
+        check_for_end_or_abort(e),
+        Base_pb2.NotificationOptions()
+    )
+    
+    print(f"[set_joint_pose] 目标关节角: {joint_angles}")
+    base.ExecuteAction(action)
+    
+    finished = e.wait(timeout)
+    base.Unsubscribe(notification_handle)
+    
+    if finished:
+        print("[set_joint_pose] 关节姿态设置完成。")
+    else:
+        print("[set_joint_pose] 超时或中止。")
+    
+    return finished
+
 def get_joint_angles(base_cyclic, use_radian=False):
     """
     查询当前七个关节的关节角。
@@ -374,42 +538,74 @@ def main():
         # cartesian_set(base, base_cyclic, target_x, target_y, target_z, target_theta_x, target_theta_y, target_theta_z)
         # =======================================
         # 示例7：笛卡尔空间轨迹运动
-        feedback = base_cyclic.RefreshFeedback()
-        start_pose = (
-            feedback.base.tool_pose_x,
-            feedback.base.tool_pose_y,
-            feedback.base.tool_pose_z,
-            feedback.base.tool_pose_theta_x,
-            feedback.base.tool_pose_theta_y,
-            feedback.base.tool_pose_theta_z
-        )
-        target_pose = (
-            feedback.base.tool_pose_x + 0.1,
-            feedback.base.tool_pose_y,
-            feedback.base.tool_pose_z,
-            feedback.base.tool_pose_theta_x,
-            feedback.base.tool_pose_theta_y,
-            feedback.base.tool_pose_theta_z
-        )
-        poses = [start_pose, target_pose]
-        cartesian_sequnence_move(base, poses, blending_radius=0.0, timeout=30)
+        # feedback = base_cyclic.RefreshFeedback()
+        # start_pose = (
+        #     feedback.base.tool_pose_x,
+        #     feedback.base.tool_pose_y,
+        #     feedback.base.tool_pose_z,
+        #     feedback.base.tool_pose_theta_x,
+        #     feedback.base.tool_pose_theta_y,
+        #     feedback.base.tool_pose_theta_z
+        # )
+        # target_pose = (
+        #     feedback.base.tool_pose_x + 0.1,
+        #     feedback.base.tool_pose_y,
+        #     feedback.base.tool_pose_z,
+        #     feedback.base.tool_pose_theta_x,
+        #     feedback.base.tool_pose_theta_y,
+        #     feedback.base.tool_pose_theta_z
+        # )
+        # poses = [start_pose, target_pose]
+        # cartesian_sequnence_move(base, poses, blending_radius=0.0, timeout=30)
+        # # =======================================
+        # # 示例8：正运动学
+        # joint_angles_now = get_joint_angles(base_cyclic, use_radian=False)
+        # fk_pose = compute_fk(base, joint_angles_now)
+        # print(f"[compute_fk] 当前关节角的末端位姿: {fk_pose}")
+        # # =======================================
+        # # 示例9：逆运动学
+        # pose_now = (
+        #     feedback.base.tool_pose_x,
+        #     feedback.base.tool_pose_y,
+        #     feedback.base.tool_pose_z,
+        #     feedback.base.tool_pose_theta_x,
+        #     feedback.base.tool_pose_theta_y,
+        #     feedback.base.tool_pose_theta_z
+        # )
+        # ik_angles = compute_ik(base, pose_now, guess=joint_angles_now)
+        # print(f"[compute_ik] 当前末端位姿的逆解关节角: {ik_angles}")
         # =======================================
-        # 示例8：正运动学
-        joint_angles_now = get_joint_angles(base_cyclic, use_radian=False)
-        fk_pose = compute_fk(base, joint_angles_now)
-        print(f"[compute_fk] 当前关节角的末端位姿: {fk_pose}")
+        # 示例10：获取末端位姿信息
+        # ee_position, ee_quaternion, ee_euler = get_ee_pose(base_cyclic)
+        # print(f"[get_ee_pose] 末端位置 (米): {ee_position}")
+        # print(f"[get_ee_pose] 末端四元数 [w,x,y,z]: {ee_quaternion}")
+        # print(f"[get_ee_pose] 末端欧拉角 [roll,pitch,yaw] (弧度): {ee_euler}")
+        # print(f"[get_ee_pose] 末端欧拉角 [roll,pitch,yaw] (度): {np.degrees(ee_euler)}")
         # =======================================
-        # 示例9：逆运动学
-        pose_now = (
-            feedback.base.tool_pose_x,
-            feedback.base.tool_pose_y,
-            feedback.base.tool_pose_z,
-            feedback.base.tool_pose_theta_x,
-            feedback.base.tool_pose_theta_y,
-            feedback.base.tool_pose_theta_z
-        )
-        ik_angles = compute_ik(base, pose_now, guess=joint_angles_now)
-        print(f"[compute_ik] 当前末端位姿的逆解关节角: {ik_angles}")
+        # 示例11：获取末端受力信息
+        ee_force, total_force = get_ee_force(base_cyclic)
+        print(f"[get_ee_force] 末端力分量 [fx,fy,fz] (牛顿): {ee_force}")
+        print(f"[get_ee_force] 末端合力大小 (牛顿): {total_force}")
+        # =======================================
+        # 示例12：获取关节速度信息
+        joint_velocities_deg = get_joint_vel(base_cyclic, use_radian=False)
+        print(f"[get_joint_vel] 当前七个关节的速度（度/秒）: {joint_velocities_deg}")
+        joint_velocities_rad = get_joint_vel(base_cyclic, use_radian=True)
+        print(f"[get_joint_vel] 当前七个关节的速度（弧度/秒）: {joint_velocities_rad}")
+        # =======================================
+        # 示例13：设置关节姿态
+        # 获取当前关节角作为参考
+        current_joint_angles = get_joint_angles(base_cyclic, use_radian=False)
+        print(f"[set_joint_pose] 当前关节角: {current_joint_angles}")
+        
+        # 设置到零位姿态
+        # set_joint_pose(base, [0, 0, 0, 0, 0, 0, 0])
+        
+        # 设置到示例姿态（注释掉以避免意外移动）
+        # example_pose = [90, 45, -30, 0, 60, -45, 0]
+        # set_joint_pose(base, example_pose)
+        
+        print("[set_joint_pose] 关节姿态设置功能已准备就绪（示例代码已注释）")
 
 if __name__ == "__main__":
     main() 
