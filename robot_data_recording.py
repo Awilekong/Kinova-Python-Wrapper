@@ -46,13 +46,7 @@ def publish_static_tf(broadcaster):
         "franka_base",              # 子坐标系
         "/vicon/franka_table/franka_table"  # 父坐标系
     )
-    broadcaster.sendTransform(
-        (-1.0+0.025, 0.0, 0.015),  # 平移向量（米）
-        (0.0, 0.0, 0.0, 1.0),      # 四元数（无旋转）
-        rospy.Time.now(),
-        "kinova_base",              # 子坐标系
-        "/vicon/franka_table/franka_table"  # 父坐标系
-    )
+
 def get_rl_pipeline(selected_serial):
     """
     初始化RealSense相机管道
@@ -332,7 +326,7 @@ if __name__ == '__main__':
 
     # 录制相关初始化
     parser = argparse.ArgumentParser()
-    parser.add_argument('--arm', default='left', type=str)        # 机械臂：left, right   ， kinova     
+    parser.add_argument('--arm', default='left', type=str)        # 机械臂：left, right        
     parser.add_argument('--cam', default='cam_up', type=str)      # 相机：up, down（初始夹爪位置）
     parser.add_argument('--zip', default='zip_top', type=str)     # 拉链：top, bottom（拉链位置）
     parser.add_argument('--item', default='small_box', type=str)  # 物品类型
@@ -372,7 +366,9 @@ if __name__ == '__main__':
         
         # 获取人类手部位置（通过VICON系统）
         try:
-            (human_trans, human_rot) = listener.lookupTransform('franka_base', '/vicon/franka_human/franka_human', rospy.Time(0))
+            (human_trans, human_rot) = listener.lookupTransform('franka_table', '/vicon/franka_human/franka_human', rospy.Time(0))
+            (trans_w, rot_w) = listener.lookupTransform('franka_table', '/vicon/franka_human/franka_human', rospy.Time(0))
+        ## =======================修改==============
         except (tf.LookupException, tf.ConnectivityException, tf.ExtrapolationException):
             rospy.logwarn("Failed to lookup transform from gripper to franka_base.")
             continue
@@ -433,6 +429,8 @@ if __name__ == '__main__':
             # 保存数据
             data['translation'].append(human_trans)
             data['rotation'].append(human_rot)
+            data['translation_w'].append(trans_w)
+            data['rotation_w'].append(rot_w)
             data['gripper_w'].append(gripper_state)
             data['rgb'].append(rgb)
             data['depth'].append(depth*1)

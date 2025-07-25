@@ -13,6 +13,8 @@ import threading
 import time
 import numpy as np
 from scipy.spatial.transform import Rotation
+from ikpy.chain import Chain
+from ikpy.link import URDFLink
 from kortex_api.autogen.client_stubs.BaseClientRpc import BaseClient
 from kortex_api.autogen.client_stubs.BaseCyclicClientRpc import BaseCyclicClient
 from kortex_api.autogen.client_stubs.ActuatorConfigClientRpc import ActuatorConfigClient
@@ -20,6 +22,41 @@ from kortex_api.autogen.client_stubs.ActuatorCyclicClientRpc import ActuatorCycl
 from kortex_api.autogen.client_stubs.ControlConfigClientRpc import ControlConfigClient
 from kortex_api.autogen.messages import Base_pb2, BaseCyclic_pb2, ActuatorConfig_pb2, ControlConfig_pb2
 from kortex_api.RouterClient import RouterClientSendOptions
+
+
+
+def build_kdl_chain(urdf_path, base_link, tip_link):
+    robot = URDF.from_xml_file(urdf_path)
+    ok, tree = kdl_parser.treeFromUrdfModel(robot)
+    if not ok:
+        raise RuntimeError("Failed to convert URDF to KDL tree")
+    chain = tree.getChain(base_link, tip_link)
+    return chain
+
+def create_ik_solver(chain):
+    fk_solver  = kdl.ChainFkSolverPos_recursive(chain)
+    jac_solver = kdl.ChainJntToJacSolver(chain)
+    ik_solver  = kdl.ChainIkSolverPos_LMA(chain, eps=1e-6, maxiter=1000)
+    return ik_solver, fk_solver, jac_solver
+
+def solve_ik(ik_solver, initial_q, target_frame):
+    result_q = kdl.JntArray(initial_q.rows())
+    ret = ik_solver.CartToJnt(initial_q, target_frame, result_q)
+    if ret < 0:
+        raise RuntimeError(f"IK solver failed (error code {ret})")
+    return result_q
+
+def pose_to_kdl_frame(pose):
+    if len(pose) != 6:
+        raise ValueError("pose 必须为长度为6的元组或列表")
+    x, y, z, roll, pitch, yaw = pose
+    # 若输入为角度，需转为弧度
+    if np.abs(roll) > 2*np.pi or np.abs(pitch) > 2*np.pi or np.abs(yaw) > 2*np.pi:
+        roll, pitch, yaw = np.radians([roll, pitch, yaw])
+    rot = kdl.Rotation.RPY(roll, pitch, yaw)
+    pos = kdl.Vector(x, y, z)
+    return kdl.Frame(rot, pos)
+
 
 # 尝试导入PyLibRM夹爪库
 try:
@@ -31,6 +68,7 @@ except ImportError:
 
 # 默认动作等待超时时间（秒）
 TIMEOUT_DURATION = 20
+
 
 def check_for_end_or_abort(e):
     """
@@ -54,7 +92,7 @@ class Kinova:
     Kinova类：Kinova机械臂高层控制接口，封装了常用的运动、状态查询等功能。
     """
     
-    def __init__(self, robot_ip="192.168.1.10", port=10000, relative_dynamics_factor=0.05, 
+    def __init__(self, robot_ip="192.168.31.13", port=10000, relative_dynamics_factor=0.05, 
                  gripper_port="/dev/ttyUSB0", gripper_baudrate=115200, gripper_slave_id=1):
         """
         初始化Kinova机械臂对象。
@@ -142,6 +180,18 @@ class Kinova:
             except Exception as e:
                 print(f"[Kinova] 夹爪连接失败: {e}")
                 self.gripper = None
+        
+        # 加载ikpy机械臂链
+        urdf_path = os.path.join(os.path.dirname(__file__), "GEN3-7DOF-VISION_ARM_URDF_V12.urdf")
+        # 自动替换continuous为revolute，生成临时URDF
+        with open(urdf_path, "r") as f:
+            urdf_str = f.read()
+        urdf_str = urdf_str.replace('type="continuous"', 'type="revolute"')
+        tmp_urdf_path = os.path.join(os.path.dirname(__file__), "gen3_tmp_ikpy.urdf")
+        with open(tmp_urdf_path, "w") as f:
+            f.write(urdf_str)
+        self.chain = Chain.from_urdf_file(tmp_urdf_path, base_elements=["base_link"])
+        print("[Kinova] ikpy机械臂链初始化成功")
         
         # 确保机械臂处于安全状态
         self.recover_from_errors()
@@ -328,55 +378,51 @@ class Kinova:
     def set_ee_pose(self, ee_trans, ee_quat, asynchronous=False):
         """
         控制末端到达指定的空间位置和姿态（四元数）。
+        通过逆运动学计算关节角，然后使用关节空间控制实现。
         
         参数：
-            ee_trans (np.ndarray): 目标末端位置
-            ee_quat (np.ndarray): 目标末端四元数
+            ee_trans (np.ndarray): 目标末端位置 [x, y, z]
+            ee_quat (np.ndarray): 目标末端四元数 [x, y, z, w]
             asynchronous (bool): 是否异步执行
         """
-        # 应用位姿偏移
+        # 确保输入是numpy数组
+        ee_trans = np.array(ee_trans)
+        ee_quat = np.array(ee_quat)
+        
+        # 应用位姿偏移（如果需要）
         target_ee_trans = ee_trans - self.pose_shift
         
         # 将四元数转换为欧拉角
         rotation = Rotation.from_quat(ee_quat)
         euler_angles = rotation.as_euler('xyz', degrees=True)
+
+        # 构造完整位姿
+        target_pose = (
+            target_ee_trans[0],  # x
+            target_ee_trans[1],  # y
+            target_ee_trans[2],  # z
+            euler_angles[0],     # theta_x
+            euler_angles[1],     # theta_y
+            euler_angles[2]      # theta_z
+        )
         
-        # 创建笛卡尔位姿动作
-        action = Base_pb2.Action()
-        action.name = "Set EE Pose"
-        action.application_data = ""
+        # 获取当前关节角作为逆运动学的初始猜测值
+        current_joints = list(self.get_joint_pose())
         
-        cartesian_pose = action.reach_pose.target_pose
-        cartesian_pose.x = target_ee_trans[0]
-        cartesian_pose.y = target_ee_trans[1]
-        cartesian_pose.z = target_ee_trans[2]
-        cartesian_pose.theta_x = euler_angles[0]
-        cartesian_pose.theta_y = euler_angles[1]
-        cartesian_pose.theta_z = euler_angles[2]
-        
-        if not asynchronous:
-            e = threading.Event()
-            notification_handle = self.base.OnNotificationActionTopic(
-                check_for_end_or_abort(e),
-                Base_pb2.NotificationOptions()
-            )
+        try:
+            # 计算逆运动学
+            joint_angles = self.ik(target_pose, guess=current_joints)
+            print(f"[Kinova Debug] 逆运动学计算结果（关节角）: {joint_angles}")
             
-            print(f"[Kinova] 移动到末端位姿: 位置={target_ee_trans}, 欧拉角={euler_angles}")
-            self.base.ExecuteAction(action)
+            # 使用关节空间控制到达目标位姿
+            success = self.set_joint_pose(joint_angles, asynchronous)
             
-            finished = e.wait(self.timeout_duration)
-            self.base.Unsubscribe(notification_handle)
+            return success
             
-            if finished:
-                print("[Kinova] 末端位姿设置完成")
-            else:
-                print("[Kinova] 末端位姿设置超时或中止")
-            
-            return finished
-        else:
-            print(f"[Kinova] 异步移动到末端位姿: 位置={target_ee_trans}, 欧拉角={euler_angles}")
-            self.base.ExecuteAction(action)
-            return True
+        except Exception as e:
+            print(f"[Kinova] 末端位姿设置失败: {e}")
+            return False
+
     
     def set_joint_pose(self, joint_pose, asynchronous=False):
         """
@@ -508,7 +554,7 @@ class Kinova:
         # 应用位姿偏移
         shifted_ee_trans = ee_trans + self.pose_shift
         
-        return shifted_ee_trans, ee_quat, ee_euler_rad
+        return shifted_ee_trans, ee_quat, ee_euler_deg
     
     def get_joint_pose(self):
         """
@@ -732,37 +778,32 @@ class Kinova:
     def compute_fk(self, joint_angles):
         """
         正运动学：根据关节角计算末端位姿。
-        
         参数：
             joint_angles (list[float]): 长度为7的关节角度列表（度）。
         返回：
-            tuple[float]: (x, y, z, theta_x, theta_y, theta_z)
+            tuple: (x, y, z, theta_x, theta_y, theta_z)
         """
         if not isinstance(joint_angles, (list, tuple)) or len(joint_angles) != 7:
             raise ValueError("joint_angles 必须为长度为7的列表或元组")
-        
+        from kortex_api.autogen.messages import Base_pb2
         joint_angles_msg = Base_pb2.JointAngles()
         for idx, angle in enumerate(joint_angles):
             joint_angle = joint_angles_msg.joint_angles.add()
             joint_angle.joint_identifier = idx
             joint_angle.value = angle
-        
         pose = self.base.ComputeForwardKinematics(joint_angles_msg)
         return (pose.x, pose.y, pose.z, pose.theta_x, pose.theta_y, pose.theta_z)
-    
+
     def compute_ik(self, pose, guess=None):
         """
         逆运动学：根据末端位姿计算关节角。
-        
         参数：
-            pose (tuple[float]): 末端位姿 (x, y, z, theta_x, theta_y, theta_z)。
+            pose (tuple[float]): 末端位姿 (x, y, z, theta_x, theta_y, theta_z)
             guess (list[float]|None): 可选，长度为7的关节角初始猜测（度），有助于收敛。
         返回：
             list[float]: 七个关节角度列表（度）。
         """
-        if not isinstance(pose, (list, tuple)) or len(pose) != 6:
-            raise ValueError("pose 必须为长度为6的元组或列表")
-        
+        from kortex_api.autogen.messages import Base_pb2
         ik_data = Base_pb2.IKData()
         ik_data.cartesian_pose.x = pose[0]
         ik_data.cartesian_pose.y = pose[1]
@@ -770,16 +811,40 @@ class Kinova:
         ik_data.cartesian_pose.theta_x = pose[3]
         ik_data.cartesian_pose.theta_y = pose[4]
         ik_data.cartesian_pose.theta_z = pose[5]
-        
-        if guess is not None:
-            if not isinstance(guess, (list, tuple)) or len(guess) != 7:
-                raise ValueError("guess 必须为长度为7的列表或元组")
+        if guess is not None and len(guess) == 7:
             for angle in guess:
                 jAngle = ik_data.guess.joint_angles.add()
                 jAngle.value = angle
-        
         joint_angles_msg = self.base.ComputeInverseKinematics(ik_data)
         return [ja.value for ja in joint_angles_msg.joint_angles]
+
+    def ik(self, pose, guess=None):
+        """
+        逆运动学：根据末端位姿计算关节角。
+        欧拉角-180-180
+        guess: 0-360
+        输出0-360
+        """
+        from kortex_api.autogen.messages import Base_pb2
+        input_IkData = Base_pb2.IKData()
+        
+        # Fill the IKData Object with the cartesian coordinates that need to be converted
+        input_IkData.cartesian_pose.x = pose[0]
+        input_IkData.cartesian_pose.y = pose[1]
+        input_IkData.cartesian_pose.z = pose[2]
+        input_IkData.cartesian_pose.theta_x = pose[3]
+        input_IkData.cartesian_pose.theta_y = pose[4]
+        input_IkData.cartesian_pose.theta_z = pose[5]
+
+        # Fill the IKData Object with the guessed joint angles
+        for joint_angle in guess:
+            jAngle = input_IkData.guess.joint_angles.add()
+            # '- 1' to generate an actual "guess" for current joint angles
+            jAngle.value = joint_angle - 1
+        print("Computing Inverse Kinematics using joint angles and pose...")
+        computed_joint_angles = self.base.ComputeInverseKinematics(input_IkData)
+        result = [ja.value % 360 for ja in computed_joint_angles.joint_angles]
+        return result
     
     def cartesian_move(self, dx=0, dy=0, dz=0, dtheta_x=0, dtheta_y=0, dtheta_z=0):
         """

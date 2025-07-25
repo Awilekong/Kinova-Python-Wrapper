@@ -40,18 +40,20 @@ class KinovaToolConfiguration:
             # Robotiq 2-Finger 85的典型参数
             tool_config.tool_transform.x = 0.0      # 米
             tool_config.tool_transform.y = 0.0      # 米  
-            tool_config.tool_transform.z = 0.085    # 85mm偏移
+            tool_config.tool_transform.z = 0.1643    # 85mm偏移
+            # tool_config.tool_transform.z = 0.45    # 85mm偏移
             tool_config.tool_transform.theta_x = 0.0  # 度
             tool_config.tool_transform.theta_y = 0.0  # 度
             tool_config.tool_transform.theta_z = 0.0  # 度
             
             # 设置工具质量
-            tool_config.tool_mass = 0.5  # 千克
+            tool_config.tool_mass = 1.2  # 千克
+            # tool_config.tool_mass = 1.8  # 千克
             
             # 设置工具质心位置
             tool_config.tool_mass_center.x = 0.0
             tool_config.tool_mass_center.y = 0.0
-            tool_config.tool_mass_center.z = 0.0425  # 质心在夹爪中心
+            tool_config.tool_mass_center.z = 0.0821  # 质心在夹爪中心
             
             # 应用配置
             self.kinova.control_config.SetToolConfiguration(tool_config)
@@ -151,7 +153,7 @@ def example_tool_configuration():
     except Exception as e:
         print(f"✗ Kinova机械臂连接失败: {e}")
         return
-    
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          
     # 创建工具配置管理器
     tool_config = KinovaToolConfiguration(kinova)
     
