@@ -110,8 +110,8 @@ if __name__ == "__main__":
     # target_pos = rospy.get_param("~position", [0.39564483, 0.52938525, 0.56558619])
     # target_pos = rospy.get_param("~position", [0.58978486, -0.04194625,  0.52358619])
     # target_quat = rospy.get_param("~orientation", [-0.1352738 ,  0.8102906 ,  0.56048334,  -0.10532])
-    target_pos = rospy.get_param("~position", [0.64933425, 0.18135323, 0.41878936])
-    target_quat = rospy.get_param("~orientation", [0.07405926, 0.9313057 , 0.35383276, 0.04457909])
+    target_pos = rospy.get_param("~position", [0.49719363, 0.28443663, 0.46399614])
+    target_quat = rospy.get_param("~orientation", [-0.04681407,  0.72486689,  0.68729552,  0.00114685])
     # target_quat = rospy.get_param("~orientation", [0.1100265 ,  0.13985512, -0.56511582,  0.80559222])
     # 90° 转成弧度
     ry90 = math.radians(90)

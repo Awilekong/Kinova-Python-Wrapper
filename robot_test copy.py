@@ -18,7 +18,7 @@ xyz, quat, rpy = arm.get_ee_pose()
 # print("ik:",joint_angles)
 
 
-xyz = [0.552, 0.196, 0.508]
+xyz = [0.3, 0.1, 0.3]
 quat = [0.02174881, 0.93459244, 0.35307589, 0.03743484]
 
 # print(pos)
@@ -28,7 +28,10 @@ quat = [0.02174881, 0.93459244, 0.35307589, 0.03743484]
 pose = [xyz[0], xyz[1], xyz[2], quat[0], quat[1], quat[2], quat[3]]
 joint_angles_deg = arm.get_joint_pose()
 print("当前关节角", joint_angles_deg)
-arm.set_ee_pose(xyz, quat)
+# arm.set_ee_pose(xyz, quat)
+# arm.ee_move(xyz, quat, asynchronous=True)
+pose, quat, rpy = arm.get_ee_pose()
+print(pose, quat)
 
 # angles_rad = [np.deg2rad(a) for a in joint_angles_deg]
 # print(angles_rad)

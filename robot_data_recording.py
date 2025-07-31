@@ -331,7 +331,7 @@ if __name__ == '__main__':
     parser.add_argument('--zip', default='zip_top', type=str)     # 拉链：top, bottom（拉链位置）
     parser.add_argument('--item', default='small_box', type=str)  # 物品类型
     parser.add_argument('--data_mode', default='grasp', type=str) # 数据模式：grasp, open, grasp_noise, open_noise
-    parser.add_argument('--base_path', default='./paper_hdf5_v4/human', type=str)  # 数据保存路径
+    parser.add_argument('--base_path', default='./kinova_data/human', type=str)  # 数据保存路径
     args = parser.parse_args()
 
     # 创建保存路径
@@ -343,7 +343,9 @@ if __name__ == '__main__':
     pipeline, detector = init_devices(args.arm)
 
     # 主循环
-    data = {'rgb':[], 'depth':[], 'translation':[], 'rotation':[], 'gripper_w':[]}  # 数据存储字典
+    # data = {'rgb':[], 'depth':[], 'translation':[], 'rotation':[], 'gripper_w':[]}  # 数据存储字典
+    data = {'rgb':[], 'depth':[], 'translation':[], 'rotation':[],'translation_world':[], 'rotation_world':[], 'gripper_w':[]}  # 重置数据
+
     event_list = collections.deque(maxlen=5)  # 事件队列，用于检测稳定的触发条件
     marker_left, marker_right = None, None
     gripper_state = 0.04  # 初始夹爪状态（张开）
@@ -366,8 +368,8 @@ if __name__ == '__main__':
         
         # 获取人类手部位置（通过VICON系统）
         try:
-            (human_trans, human_rot) = listener.lookupTransform('franka_table', '/vicon/franka_human/franka_human', rospy.Time(0))
-            (trans_w, rot_w) = listener.lookupTransform('franka_table', '/vicon/franka_human/franka_human', rospy.Time(0))
+            (human_trans, human_rot) = listener.lookupTransform('franka_base', '/vicon/franka_human/franka_human', rospy.Time(0))
+            (trans_w, rot_w) = listener.lookupTransform('vicon/world', '/vicon/franka_human/franka_human', rospy.Time(0))
         ## =======================修改==============
         except (tf.LookupException, tf.ConnectivityException, tf.ExtrapolationException):
             rospy.logwarn("Failed to lookup transform from gripper to franka_base.")
@@ -386,17 +388,18 @@ if __name__ == '__main__':
             ready = False
             print('start recording')
 
-            # 交替设置拉链位置（top/bottom）
-            if g_count % 2 == 0:
-                zip_pos = 'zip_bottom'
-            else:
-                zip_pos = 'zip_top'
-            human_traj_save_path = os.path.join(args.base_path, args.data_mode, args.item, zip_pos, args.cam)
-            if not os.path.exists(human_traj_save_path):
-                os.makedirs(human_traj_save_path)
 
-            add_text(rgb, zip_pos)
-            print('----------- current zip pose', zip_pos)
+            # # 交替设置拉链位置（top/bottom）
+            # if g_count % 2 == 0:
+            #     zip_pos = 'zip_bottom'
+            # else:
+            #     zip_pos = 'zip_top'
+            # human_traj_save_path = os.path.join(args.base_path, args.data_mode, args.item, zip_pos, args.cam)
+            # if not os.path.exists(human_traj_save_path):
+            #     os.makedirs(human_traj_save_path)
+
+            # add_text(rgb, zip_pos)
+            # print('----------- current zip pose', zip_pos)
             
         elif event_tirgger and start:  # 触发跳过帧（标记消失时）
             print('skip frame', len(data['gripper_w']))
@@ -408,7 +411,7 @@ if __name__ == '__main__':
             print('stop recording', len(data['gripper_w']))
 
             save_data(human_traj_save_path)
-            data = {'rgb':[], 'depth':[], 'translation':[], 'rotation':[], 'gripper_w':[]}  # 重置数据
+            data = {'rgb':[], 'depth':[], 'translation':[], 'rotation':[],'translation_world':[], 'rotation_world':[], 'gripper_w':[]}  # 重置数据
             g_count += 1
             pre_trans, pre_quat = None, None
 
@@ -417,20 +420,20 @@ if __name__ == '__main__':
             if pre_trans is None:
                 pre_trans, pre_quat = human_trans, human_rot
 
-            # 计算位置和姿态变化
-            trans_diff_pre = np.linalg.norm(np.array(human_trans) - np.array(pre_trans))
-            euler_diff_pre = get_euler_difference(human_rot, pre_quat)
+            # # 计算位置和姿态变化
+            # trans_diff_pre = np.linalg.norm(np.array(human_trans) - np.array(pre_trans))
+            # euler_diff_pre = get_euler_difference(human_rot, pre_quat)
 
-            # 过滤异常跳变（位置变化>5cm或角度变化>15度）
-            if trans_diff_pre > 0.05 or euler_diff_pre > 15.0:
-                print('!!!!!!!!!!!!!!!!!!! skip frame jump', trans_diff_pre, euler_diff_pre)
-                continue
+            # # 过滤异常跳变（位置变化>5cm或角度变化>15度）
+            # if trans_diff_pre > 0.05 or euler_diff_pre > 15.0:
+            #     print('!!!!!!!!!!!!!!!!!!! skip frame jump', trans_diff_pre, euler_diff_pre)
+            #     continue
 
             # 保存数据
             data['translation'].append(human_trans)
             data['rotation'].append(human_rot)
-            data['translation_w'].append(trans_w)
-            data['rotation_w'].append(rot_w)
+            data['translation_world'].append(trans_w)
+            data['rotation_world'].append(rot_w)
             data['gripper_w'].append(gripper_state)
             data['rgb'].append(rgb)
             data['depth'].append(depth*1)

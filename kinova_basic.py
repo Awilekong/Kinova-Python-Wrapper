@@ -13,8 +13,6 @@ import threading
 import time
 import numpy as np
 from scipy.spatial.transform import Rotation
-from ikpy.chain import Chain
-from ikpy.link import URDFLink
 from kortex_api.autogen.client_stubs.BaseClientRpc import BaseClient
 from kortex_api.autogen.client_stubs.BaseCyclicClientRpc import BaseCyclicClient
 from kortex_api.autogen.client_stubs.ActuatorConfigClientRpc import ActuatorConfigClient
@@ -22,40 +20,6 @@ from kortex_api.autogen.client_stubs.ActuatorCyclicClientRpc import ActuatorCycl
 from kortex_api.autogen.client_stubs.ControlConfigClientRpc import ControlConfigClient
 from kortex_api.autogen.messages import Base_pb2, BaseCyclic_pb2, ActuatorConfig_pb2, ControlConfig_pb2
 from kortex_api.RouterClient import RouterClientSendOptions
-
-
-
-def build_kdl_chain(urdf_path, base_link, tip_link):
-    robot = URDF.from_xml_file(urdf_path)
-    ok, tree = kdl_parser.treeFromUrdfModel(robot)
-    if not ok:
-        raise RuntimeError("Failed to convert URDF to KDL tree")
-    chain = tree.getChain(base_link, tip_link)
-    return chain
-
-def create_ik_solver(chain):
-    fk_solver  = kdl.ChainFkSolverPos_recursive(chain)
-    jac_solver = kdl.ChainJntToJacSolver(chain)
-    ik_solver  = kdl.ChainIkSolverPos_LMA(chain, eps=1e-6, maxiter=1000)
-    return ik_solver, fk_solver, jac_solver
-
-def solve_ik(ik_solver, initial_q, target_frame):
-    result_q = kdl.JntArray(initial_q.rows())
-    ret = ik_solver.CartToJnt(initial_q, target_frame, result_q)
-    if ret < 0:
-        raise RuntimeError(f"IK solver failed (error code {ret})")
-    return result_q
-
-def pose_to_kdl_frame(pose):
-    if len(pose) != 6:
-        raise ValueError("pose 必须为长度为6的元组或列表")
-    x, y, z, roll, pitch, yaw = pose
-    # 若输入为角度，需转为弧度
-    if np.abs(roll) > 2*np.pi or np.abs(pitch) > 2*np.pi or np.abs(yaw) > 2*np.pi:
-        roll, pitch, yaw = np.radians([roll, pitch, yaw])
-    rot = kdl.Rotation.RPY(roll, pitch, yaw)
-    pos = kdl.Vector(x, y, z)
-    return kdl.Frame(rot, pos)
 
 
 # 尝试导入PyLibRM夹爪库
@@ -93,7 +57,7 @@ class Kinova:
     """
     
     def __init__(self, robot_ip="192.168.31.13", port=10000, relative_dynamics_factor=0.05, 
-                 gripper_port="/dev/ttyUSB0", gripper_baudrate=115200, gripper_slave_id=1):
+                 gripper_port="/dev/ttyUSB0", gripper_baudrate=115200, gripper_slave_id=1, use_curo_ik=False):
         """
         初始化Kinova机械臂对象。
         
@@ -197,7 +161,110 @@ class Kinova:
         self.recover_from_errors()
         
         print(f"[Kinova] 成功连接到 {robot_ip}:{port}")
+
+        if use_curo_ik:
+            # Third Party
+            import torch
+
+            # cuRobo
+            from curobo.types.base import TensorDeviceType
+            from curobo.types.math import Pose
+            from curobo.types.robot import RobotConfig
+            from curobo.util_file import get_robot_configs_path, join_path, load_yaml, get_robot_path
+            from curobo.wrap.reacher.ik_solver import IKSolver, IKSolverConfig
+            from curobo.cuda_robot_model.cuda_robot_model import CudaRobotModel
+
+            urdf_file = "/home/xi/pwei_space/curo/test/GEN3-7DOF-VISION_ARM_URDF_V12.urdf"
+            base_link = "base_link"
+            ee_link = "end_effector_link"
+            tensor_args = TensorDeviceType()
+            self.robot_cfg = RobotConfig.from_basic(urdf_file, base_link, ee_link, tensor_args)
+            self.solver = IKSolver(self.robot_cfg)
+
     
+    def curo_ik(self, position, quat, guess=None):
+        """
+        使用curobo的ik求解器求解逆运动学。
+        
+        参数：
+            position (list/np.ndarray): 目标位置，格式为[x, y, z]
+            quat (list/np.ndarray): 目标四元数，格式为[x, y, z, w]
+            guess (list/np.ndarray): 初始猜测关节角（可选）  0-360
+        返回：
+            list/np.ndarray: 关节角 -pi~pi
+        """
+        quat = quat[[3,0,1,2]]
+        if guess is None:
+            guess = self.get_joint_pose()
+            guess = [(q+180)%360-180 for q in guess]
+            guess = np.deg2rad(guess)
+        guess_tensor = torch.tensor(guess, dtype=torch.float32, device=self.tensor_args.device)
+        goal_pose = Pose(torch.tensor(position, dtype=torch.float32, device=self.tensor_args.device), 
+                         torch.tensor(quat, dtype=torch.float32, device=self.tensor_args.device))
+        retract_config = torch.tensor(guess, dtype=torch.float32, device=self.tensor_args.device).unsqueeze(0)  # shape (1, 7)
+        seed_config = torch.tensor(guess, dtype=torch.float32, device=self.tensor_args.device).unsqueeze(0).unsqueeze(0)  # shape (1, 1, 7)
+        ik_result = self.solver.solve_single(
+                    goal_pose,
+                    retract_config=retract_config,    # 连续性正则化的参考配置
+                    seed_config=seed_config,          # 用当前关节配置初始化所有 seeds
+                    return_seeds=1,                   # 只返回误差最小的解
+                    use_nn_seed=False
+                )
+        if ik_result.success[0].item():
+            result = ik_result.solution[0].cpu().tolist()
+        # 直接返回弧度，不进行角度转换
+        # 验证结果 - 修复张量形状，处理嵌套列表
+            if isinstance(result[0], list):
+                result_flat = result[0]  # 提取嵌套列表
+            else:
+                result_flat = result
+            return result_flat
+        else:
+            print("IK 求解失败")
+            return None
+
+    def curo_fk(self, joint_angles):
+        """
+        使用curobo的fk求解器求解正运动学。
+        
+        参数：
+            joint_angles (list/np.ndarray): 关节角 0-360
+        返回：
+            ee_position (list/np.ndarray): 末端位置
+            ee_quat (list/np.ndarray): 末端四元数 [x, y, z, w]
+        """
+        joint_angles = [(q+180)%360-180 for q in joint_angles]
+        joint_angles = np.deg2rad(joint_angles)
+        joint_angles_tensor = torch.tensor(joint_angles, dtype=torch.float32, device=self.tensor_args.device)
+        fk_result = self.solver.fk(joint_angles_tensor)
+        ee_position = fk_result.ee_position[0].cpu().tolist()
+        ee_quat = fk_result.ee_quaternion[0].cpu().tolist()[[1,2,3,0]]
+        return ee_position, ee_quat
+
+    def ee_move_curo(self, position, quat, asynchronous=False):
+        """
+        使用curobo的fk求解器求解正运动学。
+        
+        参数：
+            position (list/np.ndarray): 目标位置，格式为[x, y, z]
+            quat (list/np.ndarray): 目标四元数，格式为[x, y, z, w]
+            guess (list/np.ndarray): 初始猜测关节角（可选）  0-360
+        返回：
+            list/np.ndarray: 关节角
+        """
+        if not self.use_curo_ik:
+            print("curobo ik 未启用，请在初始化时设置 use_curo_ik=True")
+            return
+
+        joint_angles = self.curo_ik(position, quat)
+        if joint_angles is None:
+            print("替换为默认笛卡尔控制器")
+            self.ee_move(position, quat, asynchronous=asynchronous)
+        else:
+            joint_angles = [np.rad2deg(q) for q in joint_angles]
+            joint_angles = [(q+360)%360 for q in joint_angles]
+            self.set_joint_pose(joint_angles, asynchronous=asynchronous)
+
     def __del__(self):
         """析构函数，确保连接正确关闭。"""
         # 停止阻抗控制线程
@@ -375,53 +442,6 @@ class Kinova:
             print(f"[Kinova] 夹爪宽度设置失败: {e}")
             return False
     
-    def set_ee_pose(self, ee_trans, ee_quat, asynchronous=False):
-        """
-        控制末端到达指定的空间位置和姿态（四元数）。
-        通过逆运动学计算关节角，然后使用关节空间控制实现。
-        
-        参数：
-            ee_trans (np.ndarray): 目标末端位置 [x, y, z]
-            ee_quat (np.ndarray): 目标末端四元数 [x, y, z, w]
-            asynchronous (bool): 是否异步执行
-        """
-        # 确保输入是numpy数组
-        ee_trans = np.array(ee_trans)
-        ee_quat = np.array(ee_quat)
-        
-        # 应用位姿偏移（如果需要）
-        target_ee_trans = ee_trans - self.pose_shift
-        
-        # 将四元数转换为欧拉角
-        rotation = Rotation.from_quat(ee_quat)
-        euler_angles = rotation.as_euler('xyz', degrees=True)
-
-        # 构造完整位姿
-        target_pose = (
-            target_ee_trans[0],  # x
-            target_ee_trans[1],  # y
-            target_ee_trans[2],  # z
-            euler_angles[0],     # theta_x
-            euler_angles[1],     # theta_y
-            euler_angles[2]      # theta_z
-        )
-        
-        # 获取当前关节角作为逆运动学的初始猜测值
-        current_joints = list(self.get_joint_pose())
-        
-        try:
-            # 计算逆运动学
-            joint_angles = self.ik(target_pose, guess=current_joints)
-            print(f"[Kinova Debug] 逆运动学计算结果（关节角）: {joint_angles}")
-            
-            # 使用关节空间控制到达目标位姿
-            success = self.set_joint_pose(joint_angles, asynchronous)
-            
-            return success
-            
-        except Exception as e:
-            print(f"[Kinova] 末端位姿设置失败: {e}")
-            return False
 
     
     def set_joint_pose(self, joint_pose, asynchronous=False):
@@ -521,6 +541,164 @@ class Kinova:
             self.base.ExecuteWaypointTrajectory(waypoints)
             return True
     
+    def set_ee_trajectory(self, waypoints, optimize=False, asynchronous=False):
+        """
+        执行笛卡尔空间路径点轨迹。
+        
+        参数：
+            waypoints (list): 路径点列表，每个路径点为 (x, y, z, blending_radius, theta_x, theta_y, theta_z)
+                             x, y, z: 位置（米）
+                             blending_radius: 混合半径（米）
+                             theta_x, theta_y, theta_z: 欧拉角（度，rxyz格式）
+            asynchronous (bool): 是否异步执行
+        返回：
+            bool: True-动作完成，False-超时/中止
+        """
+        def populate_cartesian_coordinate(waypoint_information):
+            """创建笛卡尔路径点对象"""
+            waypoint = Base_pb2.CartesianWaypoint()
+            waypoint.pose.x = waypoint_information[0]
+            waypoint.pose.y = waypoint_information[1]
+            waypoint.pose.z = waypoint_information[2]
+            waypoint.blending_radius = waypoint_information[3]
+            waypoint.pose.theta_x = waypoint_information[4]
+            waypoint.pose.theta_y = waypoint_information[5]
+            waypoint.pose.theta_z = waypoint_information[6]
+            waypoint.reference_frame = Base_pb2.CARTESIAN_REFERENCE_FRAME_BASE
+            return waypoint
+        
+        try:
+            # 确保机械臂处于单级伺服模式
+            base_servo_mode = Base_pb2.ServoingModeInformation()
+            base_servo_mode.servoing_mode = Base_pb2.SINGLE_LEVEL_SERVOING
+            self.base.SetServoingMode(base_servo_mode)
+            
+            # 创建路径点列表
+            waypoints_list = Base_pb2.WaypointList()
+            # 设置持续时间，单位为秒
+            waypoints_list.duration = 0.0
+            waypoints_list.use_optimal_blending = optimize
+            
+            # 添加路径点
+            for i, waypoint_definition in enumerate(waypoints):
+                waypoint = waypoints_list.waypoints.add()
+                waypoint.name = f"waypoint_{i}"
+                waypoint.cartesian_waypoint.CopyFrom(populate_cartesian_coordinate(waypoint_definition))
+            
+            # 验证路径点有效性
+            result = self.base.ValidateWaypointList(waypoints_list)
+            if len(result.trajectory_error_report.trajectory_error_elements) != 0:
+                print("[Kinova] 路径点验证失败")
+                result.trajectory_error_report.PrintDebugString()
+                return False
+            
+            if not asynchronous:
+                # 同步执行
+                e = threading.Event()
+                notification_handle = self.base.OnNotificationActionTopic(
+                    check_for_end_or_abort(e),
+                    Base_pb2.NotificationOptions()
+                )
+                
+                print(f"[Kinova] 执行笛卡尔路径轨迹，路径点数: {len(waypoints)}")
+                self.base.ExecuteWaypointTrajectory(waypoints_list)
+                
+                finished = e.wait()
+                self.base.Unsubscribe(notification_handle)
+                
+                if finished:
+                    print("[Kinova] 笛卡尔路径轨迹执行完成")
+                else:
+                    print("[Kinova] 笛卡尔路径轨迹执行超时或中止")
+                
+                return finished
+            else:
+                # 异步执行
+                print(f"[Kinova] 异步执行笛卡尔路径轨迹，路径点数: {len(waypoints)}")
+                self.base.ExecuteWaypointTrajectory(waypoints_list)
+                return True
+                
+        except Exception as e:
+            print(f"[Kinova] 笛卡尔路径轨迹执行失败: {e}")
+            return False
+    
+    def set_ee_trajectory_with_optimization(self, waypoints, asynchronous=False):
+        """
+        执行优化的笛卡尔空间路径点轨迹。
+        
+        参数：
+            waypoints (list): 路径点列表，每个路径点为 (x, y, z, blending_radius, theta_x, theta_y, theta_z)
+            asynchronous (bool): 是否异步执行
+        返回：
+            bool: True-动作完成，False-超时/中止
+        """
+        def populate_cartesian_coordinate(waypoint_information):
+            """创建笛卡尔路径点对象"""
+            waypoint = Base_pb2.CartesianWaypoint()
+            waypoint.pose.x = waypoint_information[0]
+            waypoint.pose.y = waypoint_information[1]
+            waypoint.pose.z = waypoint_information[2]
+            waypoint.blending_radius = waypoint_information[3]
+            waypoint.pose.theta_x = waypoint_information[4]
+            waypoint.pose.theta_y = waypoint_information[5]
+            waypoint.pose.theta_z = waypoint_information[6]
+            waypoint.reference_frame = Base_pb2.CARTESIAN_REFERENCE_FRAME_BASE
+            return waypoint
+        
+        try:
+            # 确保机械臂处于单级伺服模式
+            base_servo_mode = Base_pb2.ServoingModeInformation()
+            base_servo_mode.servoing_mode = Base_pb2.SINGLE_LEVEL_SERVOING
+            self.base.SetServoingMode(base_servo_mode)
+            
+            # 创建路径点列表（启用优化）
+            waypoints_list = Base_pb2.WaypointList()
+            waypoints_list.duration = 0.0
+            waypoints_list.use_optimal_blending = True  # 启用优化
+            
+            # 添加路径点
+            for i, waypoint_definition in enumerate(waypoints):
+                waypoint = waypoints_list.waypoints.add()
+                waypoint.name = f"waypoint_{i}"
+                waypoint.cartesian_waypoint.CopyFrom(populate_cartesian_coordinate(waypoint_definition))
+            
+            # 验证路径点有效性
+            result = self.base.ValidateWaypointList(waypoints_list)
+            if len(result.trajectory_error_report.trajectory_error_elements) != 0:
+                print("[Kinova] 优化路径点验证失败")
+                result.trajectory_error_report.PrintDebugString()
+                return False
+            
+            if not asynchronous:
+                # 同步执行
+                e = threading.Event()
+                notification_handle = self.base.OnNotificationActionTopic(
+                    check_for_end_or_abort(e),
+                    Base_pb2.NotificationOptions()
+                )
+                
+                print(f"[Kinova] 执行优化的笛卡尔路径轨迹，路径点数: {len(waypoints)}")
+                self.base.ExecuteWaypointTrajectory(waypoints_list)
+                
+                finished = e.wait(self.timeout_duration)
+                self.base.Unsubscribe(notification_handle)
+                
+                if finished:
+                    print("[Kinova] 优化的笛卡尔路径轨迹执行完成")
+                else:
+                    print("[Kinova] 优化的笛卡尔路径轨迹执行超时或中止")
+                
+                return finished
+            else:
+                # 异步执行
+                print(f"[Kinova] 异步执行优化的笛卡尔路径轨迹，路径点数: {len(waypoints)}")
+                self.base.ExecuteWaypointTrajectory(waypoints_list)
+                return True
+                
+        except Exception as e:
+            print(f"[Kinova] 优化的笛卡尔路径轨迹执行失败: {e}")
+            return False
+    
     def get_ee_pose(self):
         """
         获取当前末端位姿（位置、四元数、欧拉角）。
@@ -572,17 +750,7 @@ class Kinova:
         
         return joint_pose[:7]
     
-    def get_elbow_pose(self):
-        """
-        获取肘部位置。
-        
-        返回：
-            elbow_pose (np.ndarray): 肘部空间位置
-        """
-        # Kinova API中没有直接的肘部位置获取方法
-        # 可以通过正运动学计算得到
-        print("[Kinova] 肘部位置获取（需要正运动学计算）")
-        return np.array([0, 0, 0])  # 占位符
+
     
     def get_joint_vel(self):
         """
@@ -1110,14 +1278,381 @@ class Kinova:
         except Exception as e:
             print(f"[Kinova] 停止机械臂运动失败: {e}")
             return False
+
+    def ee_move(self, trans, quat, asynchronous=False):
+        R = Rotation.from_quat(quat)
+        euler = R.as_euler('xyz', degrees=True)
+        action = Base_pb2.Action()
+        action.name = "Example Cartesian action movement"
+        action.application_data = ""
+
+        cartesian_pose = action.reach_pose.target_pose
+        cartesian_pose.x = trans[0]        # (meters)
+        cartesian_pose.y = trans[1]    # (meters)
+        cartesian_pose.z = trans[2]    # (meters)
+        cartesian_pose.theta_x = euler[0] # (degrees)
+        cartesian_pose.theta_y = euler[1] # (degrees)
+        cartesian_pose.theta_z = euler[2] # (degrees)
+
+        e = threading.Event()
+        def concise_check(notification, e=e):
+            event_name = Base_pb2.ActionEvent.Name(notification.action_event)
+            if notification.action_event == Base_pb2.ACTION_ABORT:
+                print(f"EVENT : {event_name}  (奇异位置/无法到达/超限)")
+            else:
+                print(f"EVENT : {event_name}")
+            if notification.action_event == Base_pb2.ACTION_END \
+            or notification.action_event == Base_pb2.ACTION_ABORT:
+                e.set()
+
+        notification_handle = self.base.OnNotificationActionTopic(
+            concise_check,
+            Base_pb2.NotificationOptions()
+        )
+        if asynchronous:
+            self.base.ExecuteAction(action)
+            return True
+        else:
+            self.base.ExecuteAction(action)
+
+            finished = e.wait(self.timeout_duration)
+            self.base.Unsubscribe(notification_handle)
+
+            return finished
+
+    def set_joint_speed_limits(self, speed_limit, control_mode=None):
+        """
+        设置关节速度软限制。
+        
+        参数：
+            speed_limit (float): 关节速度限制（度/秒）
+            control_mode (int): 控制模式，默认为ANGULAR_TRAJECTORY
+        返回：
+            bool: 是否成功设置
+        """
+        try:
+            if control_mode is None:
+                control_mode = ControlConfig_pb2.ControlMode.Value('ANGULAR_TRAJECTORY')
+            
+            joint_speed_limits = ControlConfig_pb2.JointSpeedSoftLimits()
+            joint_speed_limits.control_mode = control_mode
+            joint_speed_limits.joint_speed_soft_limits = speed_limit
+            
+            self.control_config.SetJointSpeedSoftLimits(joint_speed_limits)
+            print(f"[Kinova] 关节速度限制设置为 {speed_limit} 度/秒")
+            return True
+            
+        except Exception as e:
+            print(f"[Kinova] 设置关节速度限制失败: {e}")
+            return False
     
+    def get_joint_speed_limits(self, control_mode=None):
+        """
+        获取当前关节速度软限制。
+        
+        参数：
+            control_mode (int): 控制模式，默认为ANGULAR_TRAJECTORY
+        返回：
+            float: 关节速度限制（度/秒），失败返回None
+        """
+        try:
+            if control_mode is None:
+                control_mode = ControlConfig_pb2.ControlMode.Value('ANGULAR_TRAJECTORY')
+            
+            joint_speed_limits = ControlConfig_pb2.JointSpeedSoftLimits()
+            joint_speed_limits.control_mode = control_mode
+            
+            result = self.control_config.GetJointSpeedSoftLimits(joint_speed_limits)
+            return result.joint_speed_soft_limits
+            
+        except Exception as e:
+            print(f"[Kinova] 获取关节速度限制失败: {e}")
+            return None
+    
+    def increase_joint_speed_limits(self, increment=10.0):
+        """
+        增大关节速度限制。
+        
+        参数：
+            increment (float): 增大量（度/秒），默认10.0
+        返回：
+            bool: 是否成功增大
+        """
+        try:
+            current_limit = self.get_joint_speed_limits()
+            if current_limit is None:
+                print("[Kinova] 无法获取当前关节速度限制")
+                return False
+            
+            new_limit = current_limit + increment
+            success = self.set_joint_speed_limits(new_limit)
+            if success:
+                print(f"[Kinova] 关节速度限制从 {current_limit} 增大到 {new_limit} 度/秒")
+            return success
+            
+        except Exception as e:
+            print(f"[Kinova] 增大关节速度限制失败: {e}")
+            return False
+    
+    def decrease_joint_speed_limits(self, decrement=10.0):
+        """
+        减小关节速度限制。
+        
+        参数：
+            decrement (float): 减小量（度/秒），默认10.0
+        返回：
+            bool: 是否成功减小
+        """
+        try:
+            current_limit = self.get_joint_speed_limits()
+            if current_limit is None:
+                print("[Kinova] 无法获取当前关节速度限制")
+                return False
+            
+            new_limit = max(0.0, current_limit - decrement)  # 确保不为负数
+            success = self.set_joint_speed_limits(new_limit)
+            if success:
+                print(f"[Kinova] 关节速度限制从 {current_limit} 减小到 {new_limit} 度/秒")
+            return success
+            
+        except Exception as e:
+            print(f"[Kinova] 减小关节速度限制失败: {e}")
+            return False
+    
+    def set_cartesian_linear_speed_limit(self, speed_limit, control_mode=None):
+        """
+        设置笛卡尔线性速度软限制。
+        
+        参数：
+            speed_limit (float): 线性速度限制（米/秒）
+            control_mode (int): 控制模式，默认为CARTESIAN_TRAJECTORY
+        返回：
+            bool: 是否成功设置
+        """
+        try:
+            if control_mode is None:
+                control_mode = ControlConfig_pb2.ControlMode.Value('CARTESIAN_TRAJECTORY')
+            
+            twist_linear_limit = ControlConfig_pb2.TwistLinearSoftLimit()
+            twist_linear_limit.control_mode = control_mode
+            twist_linear_limit.twist_linear_soft_limit = speed_limit
+            
+            self.control_config.SetTwistLinearSoftLimit(twist_linear_limit)
+            print(f"[Kinova] 笛卡尔线性速度限制设置为 {speed_limit} 米/秒")
+            return True
+            
+        except Exception as e:
+            print(f"[Kinova] 设置笛卡尔线性速度限制失败: {e}")
+            return False
+    
+    def get_cartesian_linear_speed_limit(self, control_mode=None):
+        """
+        获取当前笛卡尔线性速度软限制。
+        
+        参数：
+            control_mode (int): 控制模式，默认为CARTESIAN_TRAJECTORY
+        返回：
+            float: 线性速度限制（米/秒），失败返回None
+        """
+        try:
+            if control_mode is None:
+                control_mode = ControlConfig_pb2.ControlMode.Value('CARTESIAN_TRAJECTORY')
+            
+            twist_linear_limit = ControlConfig_pb2.TwistLinearSoftLimit()
+            twist_linear_limit.control_mode = control_mode
+            
+            result = self.control_config.GetTwistLinearSoftLimit(twist_linear_limit)
+            return result.twist_linear_soft_limit
+            
+        except Exception as e:
+            print(f"[Kinova] 获取笛卡尔线性速度限制失败: {e}")
+            return None
+    
+    def increase_cartesian_linear_speed_limit(self, increment=0.1):
+        """
+        增大笛卡尔线性速度限制。
+        
+        参数：
+            increment (float): 增大量（米/秒），默认0.1
+        返回：
+            bool: 是否成功增大
+        """
+        try:
+            current_limit = self.get_cartesian_linear_speed_limit()
+            if current_limit is None:
+                print("[Kinova] 无法获取当前笛卡尔线性速度限制")
+                return False
+            
+            new_limit = current_limit + increment
+            success = self.set_cartesian_linear_speed_limit(new_limit)
+            if success:
+                print(f"[Kinova] 笛卡尔线性速度限制从 {current_limit} 增大到 {new_limit} 米/秒")
+            return success
+            
+        except Exception as e:
+            print(f"[Kinova] 增大笛卡尔线性速度限制失败: {e}")
+            return False
+    
+    def decrease_cartesian_linear_speed_limit(self, decrement=0.1):
+        """
+        减小笛卡尔线性速度限制。
+        
+        参数：
+            decrement (float): 减小量（米/秒），默认0.1
+        返回：
+            bool: 是否成功减小
+        """
+        try:
+            current_limit = self.get_cartesian_linear_speed_limit()
+            if current_limit is None:
+                print("[Kinova] 无法获取当前笛卡尔线性速度限制")
+                return False
+            
+            new_limit = max(0.0, current_limit - decrement)  # 确保不为负数
+            success = self.set_cartesian_linear_speed_limit(new_limit)
+            if success:
+                print(f"[Kinova] 笛卡尔线性速度限制从 {current_limit} 减小到 {new_limit} 米/秒")
+            return success
+            
+        except Exception as e:
+            print(f"[Kinova] 减小笛卡尔线性速度限制失败: {e}")
+            return False
+    
+    def set_cartesian_angular_speed_limit(self, speed_limit, control_mode=None):
+        """
+        设置笛卡尔角速度软限制。
+        
+        参数：
+            speed_limit (float): 角速度限制（度/秒）
+            control_mode (int): 控制模式，默认为CARTESIAN_TRAJECTORY
+        返回：
+            bool: 是否成功设置
+        """
+        try:
+            if control_mode is None:
+                control_mode = ControlConfig_pb2.ControlMode.Value('CARTESIAN_TRAJECTORY')
+            
+            twist_angular_limit = ControlConfig_pb2.TwistAngularSoftLimit()
+            twist_angular_limit.control_mode = control_mode
+            twist_angular_limit.twist_angular_soft_limit = speed_limit
+            
+            self.control_config.SetTwistAngularSoftLimit(twist_angular_limit)
+            print(f"[Kinova] 笛卡尔角速度限制设置为 {speed_limit} 度/秒")
+            return True
+            
+        except Exception as e:
+            print(f"[Kinova] 设置笛卡尔角速度限制失败: {e}")
+            return False
+    
+    def get_cartesian_angular_speed_limit(self, control_mode=None):
+        """
+        获取当前笛卡尔角速度软限制。
+        
+        参数：
+            control_mode (int): 控制模式，默认为CARTESIAN_TRAJECTORY
+        返回：
+            float: 角速度限制（度/秒），失败返回None
+        """
+        try:
+            if control_mode is None:
+                control_mode = ControlConfig_pb2.ControlMode.Value('CARTESIAN_TRAJECTORY')
+            
+            twist_angular_limit = ControlConfig_pb2.TwistAngularSoftLimit()
+            twist_angular_limit.control_mode = control_mode
+            
+            result = self.control_config.GetTwistAngularSoftLimit(twist_angular_limit)
+            return result.twist_angular_soft_limit
+            
+        except Exception as e:
+            print(f"[Kinova] 获取笛卡尔角速度限制失败: {e}")
+            return None
+    
+    def increase_cartesian_angular_speed_limit(self, increment=10.0):
+        """
+        增大笛卡尔角速度限制。
+        
+        参数：
+            increment (float): 增大量（度/秒），默认10.0
+        返回：
+            bool: 是否成功增大
+        """
+        try:
+            current_limit = self.get_cartesian_angular_speed_limit()
+            if current_limit is None:
+                print("[Kinova] 无法获取当前笛卡尔角速度限制")
+                return False
+            
+            new_limit = current_limit + increment
+            success = self.set_cartesian_angular_speed_limit(new_limit)
+            if success:
+                print(f"[Kinova] 笛卡尔角速度限制从 {current_limit} 增大到 {new_limit} 度/秒")
+            return success
+            
+        except Exception as e:
+            print(f"[Kinova] 增大笛卡尔角速度限制失败: {e}")
+            return False
+    
+    def decrease_cartesian_angular_speed_limit(self, decrement=10.0):
+        """
+        减小笛卡尔角速度限制。
+        
+        参数：
+            decrement (float): 减小量（度/秒），默认10.0
+        返回：
+            bool: 是否成功减小
+        """
+        try:
+            current_limit = self.get_cartesian_angular_speed_limit()
+            if current_limit is None:
+                print("[Kinova] 无法获取当前笛卡尔角速度限制")
+                return False
+            
+            new_limit = max(0.0, current_limit - decrement)  # 确保不为负数
+            success = self.set_cartesian_angular_speed_limit(new_limit)
+            if success:
+                print(f"[Kinova] 笛卡尔角速度限制从 {current_limit} 减小到 {new_limit} 度/秒")
+            return success
+            
+        except Exception as e:
+            print(f"[Kinova] 减小笛卡尔角速度限制失败: {e}")
+            return False
+    
+    def print_speed_limits(self):
+        """
+        打印当前所有速度限制信息。
+        """
+        print("\n=== 当前速度限制信息 ===")
+        
+        # 关节速度限制
+        joint_limit = self.get_joint_speed_limits()
+        if joint_limit is not None:
+            print(f"关节速度限制: {joint_limit} 度/秒")
+        else:
+            print("关节速度限制: 获取失败")
+        
+        # 笛卡尔线性速度限制
+        linear_limit = self.get_cartesian_linear_speed_limit()
+        if linear_limit is not None:
+            print(f"笛卡尔线性速度限制: {linear_limit} 米/秒")
+        else:
+            print("笛卡尔线性速度限制: 获取失败")
+        
+        # 笛卡尔角速度限制
+        angular_limit = self.get_cartesian_angular_speed_limit()
+        if angular_limit is not None:
+            print(f"笛卡尔角速度限制: {angular_limit} 度/秒")
+        else:
+            print("笛卡尔角速度限制: 获取失败")
+        
+        print("========================\n")
+
 
 # 使用示例
 if __name__ == "__main__":
     # 创建Kinova对象（包含夹爪）
     kinova = None
     try:
-        kinova = Kinova(robot_ip="192.168.1.10", gripper_port="/dev/ttyUSB0")
+        kinova = Kinova(robot_ip="192.168.31.13", gripper_port="/dev/ttyUSB0")
         
         # 获取当前状态
         current_pose = kinova.get_joint_pose()
@@ -1178,6 +1713,86 @@ if __name__ == "__main__":
         kinova.stop_motion()  # 立即停止
         
         print("阻抗控制和速度调整测试完成")
+        
+        # 速度限制控制测试
+        print("\n=== 速度限制控制测试 ===")
+        
+        # 打印当前速度限制
+        kinova.print_speed_limits()
+        
+        # 测试关节速度限制控制
+        print("测试关节速度限制控制...")
+        current_joint_limit = kinova.get_joint_speed_limits()
+        if current_joint_limit is not None:
+            print(f"当前关节速度限制: {current_joint_limit} 度/秒")
+            
+            # 增大关节速度限制
+            kinova.increase_joint_speed_limits(5.0)
+            
+            # 减小关节速度限制
+            kinova.decrease_joint_speed_limits(5.0)
+        
+        # 测试笛卡尔线性速度限制控制
+        print("测试笛卡尔线性速度限制控制...")
+        current_linear_limit = kinova.get_cartesian_linear_speed_limit()
+        if current_linear_limit is not None:
+            print(f"当前笛卡尔线性速度限制: {current_linear_limit} 米/秒")
+            
+            # 增大线性速度限制
+            kinova.increase_cartesian_linear_speed_limit(0.05)
+            
+            # 减小线性速度限制
+            kinova.decrease_cartesian_linear_speed_limit(0.05)
+        
+        # 测试笛卡尔角速度限制控制
+        print("测试笛卡尔角速度限制控制...")
+        current_angular_limit = kinova.get_cartesian_angular_speed_limit()
+        if current_angular_limit is not None:
+            print(f"当前笛卡尔角速度限制: {current_angular_limit} 度/秒")
+            
+            # 增大角速度限制
+            kinova.increase_cartesian_angular_speed_limit(5.0)
+            
+            # 减小角速度限制
+            kinova.decrease_cartesian_angular_speed_limit(5.0)
+        
+        # 再次打印速度限制信息
+        kinova.print_speed_limits()
+        
+        print("速度限制控制测试完成")
+        
+        # 笛卡尔轨迹控制测试
+        print("\n=== 笛卡尔轨迹控制测试 ===")
+        
+        # 定义测试路径点（基于官方示例）
+        test_waypoints = [
+            (0.7, 0.0, 0.5, 0.0, 90.0, 0.0, 90.0),    # 起始点
+            (0.7, 0.0, 0.33, 0.1, 90.0, 0.0, 90.0),   # 下降
+            (0.7, 0.48, 0.33, 0.1, 90.0, 0.0, 90.0),  # 向右移动
+            (0.61, 0.22, 0.4, 0.1, 90.0, 0.0, 90.0),  # 斜向移动
+            (0.7, 0.48, 0.33, 0.1, 90.0, 0.0, 90.0),  # 返回
+            (0.63, -0.22, 0.45, 0.1, 90.0, 0.0, 90.0), # 向左移动
+            (0.65, 0.05, 0.33, 0.0, 90.0, 0.0, 90.0)  # 结束点
+        ]
+        
+        print("测试标准笛卡尔轨迹...")
+        success = kinova.set_ee_trajectory(test_waypoints, asynchronous=False)
+        if success:
+            print("标准笛卡尔轨迹执行成功")
+        else:
+            print("标准笛卡尔轨迹执行失败")
+        
+        # 等待一段时间再执行优化轨迹
+        time.sleep(2.0)
+        
+        print("测试优化的笛卡尔轨迹...")
+        success = kinova.set_ee_trajectory_with_optimization(test_waypoints, asynchronous=False)
+        if success:
+            print("优化的笛卡尔轨迹执行成功")
+        else:
+            print("优化的笛卡尔轨迹执行失败")
+        
+        print("笛卡尔轨迹控制测试完成")
         
     except Exception as e:
         print(f"错误: {e}")

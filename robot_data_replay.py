@@ -35,7 +35,7 @@ from kinova_basic import Kinova
 import math
 from tf.transformations import quaternion_from_euler, quaternion_multiply
 
-# from scipy.spatial.transform import Rotation
+from scipy.spatial.transform import Rotation
 
 
 # rospy.init_node("your_node_name")
@@ -222,12 +222,53 @@ def transform_A_to_B_tf(p_A, q_A):
         transformed_pose = listener.transformPose("kinova_base", pose_stamped)
         p_B = np.array([transformed_pose.pose.position.x, transformed_pose.pose.position.y, transformed_pose.pose.position.z])
         q_B = np.array([transformed_pose.pose.orientation.x, transformed_pose.pose.orientation.y, transformed_pose.pose.orientation.z, transformed_pose.pose.orientation.w])
-        print('p_B', p_B)
-        print('q_B', q_B)
+        # print('p_B', p_B)
+        # print('q_B', q_B)
         return p_B, q_B
     except (tf.LookupException, tf.ConnectivityException, tf.ExtrapolationException):
         rospy.logwarn("Transform failed")
         return None, None
+
+def batch_transform_A_to_B_tf(p_A_list, q_A_list):
+    """
+    批量使用ROS TF进行table到kinova_base的坐标变换。
+    p_A_list: list of np.array([x, y, z])，table系下位置列表
+    q_A_list: list of np.array([x, y, z, w])，table系下四元数列表
+    返回: p_B_list, q_B_list，kinova_base系下位置和四元数列表
+    """
+    listener = tf.TransformListener()
+    # 等待变换可用
+    try:
+        listener.waitForTransform("kinova_base", "table", rospy.Time(), rospy.Duration(4.0))
+    except (tf.LookupException, tf.ConnectivityException, tf.ExtrapolationException):
+        rospy.logwarn("Transform not available")
+        return [], []
+
+    p_B_list = []
+    q_B_list = []
+    for p_A, q_A in zip(p_A_list, q_A_list):
+        pose_stamped = geometry_msgs.msg.PoseStamped()
+        pose_stamped.header.frame_id = "table"
+        pose_stamped.header.stamp = rospy.Time(0)
+        pose_stamped.pose.position.x = p_A[0]
+        pose_stamped.pose.position.y = p_A[1]
+        pose_stamped.pose.position.z = p_A[2]
+        pose_stamped.pose.orientation.x = q_A[0]
+        pose_stamped.pose.orientation.y = q_A[1]
+        pose_stamped.pose.orientation.z = q_A[2]
+        pose_stamped.pose.orientation.w = q_A[3]
+
+        try:
+            transformed_pose = listener.transformPose("kinova_base", pose_stamped)
+            p_B = np.array([transformed_pose.pose.position.x, transformed_pose.pose.position.y, transformed_pose.pose.position.z])
+            q_B = np.array([transformed_pose.pose.orientation.x, transformed_pose.pose.orientation.y, transformed_pose.pose.orientation.z, transformed_pose.pose.orientation.w])
+            p_B_list.append(p_B)
+            q_B_list.append(q_B)
+        except (tf.LookupException, tf.ConnectivityException, tf.ExtrapolationException):
+            rospy.logwarn("Transform failed for one pose")
+            p_B_list.append(None)
+            q_B_list.append(None)
+    return p_B_list, q_B_list
 
 def publish_static_transform():
     """发布静态TF变换：从table到kinova_base"""
@@ -238,8 +279,8 @@ def publish_static_transform():
     static_transformStamped.header.frame_id = "table"
     static_transformStamped.child_frame_id = "kinova_base"
 
-    static_transformStamped.transform.translation.x = 1.01-0.025
-    static_transformStamped.transform.translation.y = 0.3875
+    static_transformStamped.transform.translation.x = 1.01+0.09
+    static_transformStamped.transform.translation.y = 0.39
     static_transformStamped.transform.translation.z = 0.042
 
     static_transformStamped.transform.rotation.x = 0.0
@@ -269,7 +310,7 @@ if __name__ == '__main__':
     parser.add_argument('--zip', default='zip_top', type=str)     # 拉链：top, bottom（拉链位置）
     parser.add_argument('--item', default='small_box', type=str)  # 物品类型
     parser.add_argument('--data_mode', default='grasp', type=str) # 数据模式：grasp, open, grasp_noise, open_noise
-    parser.add_argument('--idx', default=0, type=int)             # 文件索引
+    parser.add_argument('--idx', default=5, type=int)             # 文件索引
     parser.add_argument('--mode', default='trajectory', type=str)        # 模式：rgb, depth, trajectory
     args = parser.parse_args()
 
@@ -391,9 +432,31 @@ if __name__ == '__main__':
         trans_kinova_0, rot_kinova_0 = transform_A_to_B_tf(trans_list[0], quat_list[0])
         # 移动到轨迹起始位置
         # [-0.81029483, -0.13515251,  0.10532389,  0.56041321]
-        arm.set_ee_pose(trans_kinova_0, rot_kinova_0, asynchronous=False)
+        arm.ee_move(trans_kinova_0, rot_kinova_0, asynchronous=False)
+
+        # 测试waypoint
+        # trans_kinova, quat_kinova = batch_transform_A_to_B_tf(trans_list, quat_list)
+        # arm.ee_move(trans_kinova[0], quat_kinova[0], asynchronous=False)
+        # R = Rotation.from_quat(quat_kinova)
+        # euler_list = R.as_euler('xyz', degrees=True)
+        # waypoints = []
+        # waypoints.append((trans_kinova[0][0], trans_kinova[0][1], trans_kinova[0][2], 0.0, euler_list[0][0], euler_list[0][1], euler_list[0][2]))
+        # waypoints.append((trans_kinova[40][0], trans_kinova[40][1], trans_kinova[40][2], 0.0, euler_list[40][0], euler_list[40][1], euler_list[40][2]))
+        # waypoints.append((trans_kinova[80][0], trans_kinova[80][1], trans_kinova[80][2], 0.0, euler_list[80][0], euler_list[80][1], euler_list[80][2]))
+        # waypoints.append((trans_kinova[-1][0], trans_kinova[-1][1], trans_kinova[-1][2], 0.0, euler_list[-1][0], euler_list[-1][1], euler_list[-1][2]))
+        # # for i in range(len(euler_list)):
+        # #     waypoints.append((trans_kinova[i][0], trans_kinova[i][1], trans_kinova[i][2], 0.0, euler_list[i][0], euler_list[i][1], euler_list[i][2]))
+        # arm.set_ee_trajectory(waypoints, optimize=False, asynchronous=False)
+
         pose_now = arm.get_ee_pose()
         print(pose_now)
+        # euler_list = R.as_euler('xyz', degrees=True)
+        # waypoints = []
+        # for i in range(len(euler_list)):
+        #     waypoints.append((trans_kinova_0[0], trans_kinova_0[1], trans_kinova_0[2], 0.1, euler_list[i][0], euler_list[i][1], euler_list[i][2]))
+        # arm.set_ee_trajectory(waypoints, optimize=True, asynchronous=True)
+        # pose_now = arm.get_ee_pose()
+        # print(pose_now)
         input("Press Enter to start the trajectory playback...")
         
         # 轨迹偏移（可选，用于调整位置）
@@ -404,15 +467,15 @@ if __name__ == '__main__':
             # 逐帧执行轨迹（应用完整变换）
             for trans, rot, grip in zip(trans_list, quat_list, gripper_list):
                 # 将table坐标系的位姿转换到kinova坐标系
-                trans_kinova, rot_kinova = transform_pose_table_to_kinova((trans, rot), shift_kinova_test, axis_mapping)
-                arm.set_ee_pose(trans_kinova, rot_kinova, asynchronous=False)
+                trans_kinova, rot_kinova = transform_A_to_B_tf(trans, rot)
+                arm.ee_move(trans_kinova, rot_kinova, asynchronous=False)
                 # arm.set_gripper_opening(grip)  # 可选：同步夹爪状态
                 rate.sleep()
             rate.sleep()
         else:
             # Franka机械臂：使用简单的平移变换
             for trans, rot, grip in zip(trans_list, quat_list, gripper_list):
-                arm.set_ee_pose(trans+shift_franka, rot, asynchronous=False)
+                arm.ee_move(trans+shift_franka, rot, asynchronous=False)
                 # arm.set_gripper_opening(grip)  # 可选：同步夹爪状态
                 rate.sleep()
             # arm.set_gripper_opening(grip)  # 可选：同步夹爪状态
